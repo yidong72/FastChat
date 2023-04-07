@@ -10,10 +10,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaTokenizer
 
 from fastchat.conversation import conv_templates, SeparatorStyle
 from fastchat.serve.compression import compress_module
+from llama_inference import load_quant
 from fastchat.serve.monkey_patch_non_inplace import replace_llama_attn_with_non_inplace_operations
 
 
-def load_model(model_name, device, num_gpus, load_8bit=False, debug=False):
+def load_model(model_name, device, num_gpus, load_8bit=False, debug=False, checkpoint=None, wbits=4, groupsize=128):
     if device == "cpu":
         kwargs = {}
     elif device == "cuda":
@@ -22,6 +23,9 @@ def load_model(model_name, device, num_gpus, load_8bit=False, debug=False):
             if num_gpus != "auto" and int(num_gpus) != 1:
                 print("8-bit weights are not supported on multiple GPUs. Revert to use one GPU.")
             kwargs.update({"load_in_8bit": True, "device_map": "auto"})
+        elif checkpoint is not None:
+            if num_gpus == "auto":
+                kwargs["device_map"] = "auto"
         else:
             if num_gpus == "auto":
                 kwargs["device_map"] = "auto"
@@ -40,14 +44,18 @@ def load_model(model_name, device, num_gpus, load_8bit=False, debug=False):
         raise ValueError(f"Invalid device: {device}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(model_name,
-        low_cpu_mem_usage=True, **kwargs)
+    if checkpoint is not None:
+        model = load_quant(model_name, checkpoint, wbits, groupsize, 0)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True, **kwargs)
 
     # calling model.cuda() mess up weights if loading 8-bit weights
     if device == "cuda" and num_gpus == 1 and not load_8bit:
         model.to("cuda")
     elif device == "mps":
         model.to("mps")
+    elif device == "cuda" and checkpoint is not None:
+        model.to('cuda')
 
     if (device == "mps" or device == "cpu") and load_8bit:
         compress_module(model)
@@ -129,7 +137,8 @@ def main(args):
 
     # Model
     model, tokenizer = load_model(args.model_name, args.device,
-        args.num_gpus, args.load_8bit, args.debug)
+        args.num_gpus, args.load_8bit, args.debug, args.checkpoint,
+        args.wbits, args.groupsize)
 
     # Chat
     conv = conv_templates[args.conv_template].copy()
@@ -181,5 +190,14 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument(
+        '--wbits', type=int, default=4, choices=[2, 3, 4, 8, 16],
+        help='#bits to use for quantization; use 16 for evaluating base model.'
+    )
+    parser.add_argument(
+        '--groupsize', type=int, default=128,
+        help='Groupsize to use for quantization; default uses full row.'
+    )
     args = parser.parse_args()
     main(args)
